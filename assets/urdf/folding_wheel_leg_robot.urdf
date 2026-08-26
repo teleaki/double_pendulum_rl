@@ -1,0 +1,507 @@
+<?xml version="1.0"?>
+
+<robot name="folding_wheel_leg_robot">
+
+  <!-- ========================================================= -->
+  <!-- Materials                                                 -->
+  <!-- ========================================================= -->
+
+  <material name="chassis_color">
+    <color rgba="0.25 0.25 0.28 1.0"/>
+  </material>
+
+  <material name="upper_leg_color">
+    <color rgba="0.20 0.45 0.80 1.0"/>
+  </material>
+
+  <material name="lower_leg_color">
+    <color rgba="0.25 0.65 0.40 1.0"/>
+  </material>
+
+  <material name="wheel_color">
+    <color rgba="0.08 0.08 0.08 1.0"/>
+  </material>
+
+  <material name="front_marker_color">
+    <color rgba="0.90 0.10 0.10 1.0"/>
+  </material>
+
+
+  <!-- ========================================================= -->
+  <!-- Chassis                                                   -->
+  <!-- ========================================================= -->
+
+  <link name="base_link">
+
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+
+      <geometry>
+        <!-- X length, Y width, Z height -->
+        <box size="0.50 0.36 0.16"/>
+      </geometry>
+
+      <material name="chassis_color"/>
+    </visual>
+
+    <!-- Visual-only marker on the +X side of the chassis. -->
+    <visual name="front_marker">
+      <origin xyz="0.27 0 0.02" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.04 0.10 0.06"/>
+      </geometry>
+
+      <material name="front_marker_color"/>
+    </visual>
+
+
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.50 0.36 0.16"/>
+      </geometry>
+    </collision>
+
+
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+
+      <mass value="8.0"/>
+
+      <inertia
+        ixx="0.1035"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="0.1837"
+        iyz="0.0"
+        izz="0.2531"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- ========================================================= -->
+  <!-- Left upper leg                                            -->
+  <!-- ========================================================= -->
+
+  <link name="left_upper_leg">
+
+    <!--
+      Link frame is located at the hip joint.
+
+      The rod extends downward along local -Z by 0.30 m.
+      Therefore its visual/collision center is at z = -0.15 m.
+    -->
+
+    <visual>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.04 0.04 0.30"/>
+      </geometry>
+
+      <material name="upper_leg_color"/>
+    </visual>
+
+
+    <collision>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.04 0.04 0.30"/>
+      </geometry>
+    </collision>
+
+
+    <inertial>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <mass value="0.60"/>
+
+      <inertia
+        ixx="0.00458"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="0.00458"
+        iyz="0.0"
+        izz="0.00016"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- ========================================================= -->
+  <!-- Left hip                                                  -->
+  <!-- ========================================================= -->
+
+<joint name="left_hip_joint" type="revolute">
+
+  <parent link="base_link"/>
+  <child link="left_upper_leg"/>
+
+  <origin xyz="0.0 0.22 -0.06" rpy="0 0 0"/>
+  <axis xyz="0 1 0"/>
+
+  <limit
+    lower="-1.8"
+    upper="1.8"
+    effort="100.0"
+    velocity="12.0"/>
+
+</joint>
+
+
+  <!-- ========================================================= -->
+  <!-- Left lower leg                                            -->
+  <!-- ========================================================= -->
+
+  <link name="left_lower_leg">
+
+    <!--
+      Link frame is located at knee.
+
+      Lower rod extends another 0.30 m along local -Z.
+    -->
+
+    <visual>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.035 0.035 0.30"/>
+      </geometry>
+
+      <material name="lower_leg_color"/>
+    </visual>
+
+
+    <collision>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.035 0.035 0.30"/>
+      </geometry>
+    </collision>
+
+
+    <inertial>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <mass value="0.50"/>
+
+      <inertia
+        ixx="0.00382"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="0.00382"
+        iyz="0.0"
+        izz="0.00010"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- ========================================================= -->
+  <!-- Left knee                                                 -->
+  <!-- ========================================================= -->
+
+  <joint name="left_knee_joint" type="revolute">
+
+    <parent link="left_upper_leg"/>
+    <child link="left_lower_leg"/>
+
+    <!--
+      Knee is exactly at the end of upper leg.
+    -->
+    <origin xyz="0 0 -0.30" rpy="0 0 0"/>
+
+    <axis xyz="0 1 0"/>
+
+    <!-- Negative rotation folds the knee. -->
+    <limit
+      lower="-2.50"
+      upper="-0.50"
+      effort="100.0"
+      velocity="12.0"/>
+
+  </joint>
+
+
+  <!-- ========================================================= -->
+  <!-- Left wheel                                                -->
+  <!-- ========================================================= -->
+
+  <link name="left_wheel">
+
+    <!--
+      URDF cylinder is normally oriented along Z.
+
+      Rotate it 90 degrees around X so its axle lies along Y.
+    -->
+
+    <visual>
+      <origin xyz="0 0 0" rpy="1.57079632679 0 0"/>
+
+      <geometry>
+        <cylinder
+          radius="0.10"
+          length="0.06"/>
+      </geometry>
+
+      <material name="wheel_color"/>
+    </visual>
+
+
+    <collision>
+      <origin xyz="0 0 0" rpy="1.57079632679 0 0"/>
+
+      <geometry>
+        <cylinder
+          radius="0.10"
+          length="0.06"/>
+      </geometry>
+    </collision>
+
+
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+
+      <mass value="0.35"/>
+
+      <!--
+        Cylinder axis is Y.
+
+        Iyy: inertia around wheel axle.
+        Ixx/Izz: inertia perpendicular to axle.
+      -->
+      <inertia
+        ixx="0.00098"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="0.00175"
+        iyz="0.0"
+        izz="0.00098"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- ========================================================= -->
+  <!-- Left wheel joint                                          -->
+  <!-- ========================================================= -->
+
+  <joint name="left_wheel_joint" type="continuous">
+
+    <parent link="left_lower_leg"/>
+    <child link="left_wheel"/>
+
+    <!-- Wheel axle is at the end of lower leg -->
+    <origin xyz="0 0 -0.30" rpy="0 0 0"/>
+
+    <axis xyz="0 1 0"/>
+
+    <limit
+      effort="25.0"
+      velocity="100.0"/>
+
+  </joint>
+
+
+  <!-- ========================================================= -->
+  <!-- Right upper leg                                           -->
+  <!-- ========================================================= -->
+
+  <link name="right_upper_leg">
+
+    <visual>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.04 0.04 0.30"/>
+      </geometry>
+
+      <material name="upper_leg_color"/>
+    </visual>
+
+
+    <collision>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.04 0.04 0.30"/>
+      </geometry>
+    </collision>
+
+
+    <inertial>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <mass value="0.60"/>
+
+      <inertia
+        ixx="0.00458"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="0.00458"
+        iyz="0.0"
+        izz="0.00016"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- ========================================================= -->
+  <!-- Right hip                                                 -->
+  <!-- ========================================================= -->
+
+<joint name="right_hip_joint" type="revolute">
+
+  <parent link="base_link"/>
+  <child link="right_upper_leg"/>
+
+  <origin xyz="0.0 -0.22 -0.06" rpy="0 0 0"/>
+  <axis xyz="0 1 0"/>
+
+  <limit
+    lower="-1.8"
+    upper="1.8"
+    effort="100.0"
+    velocity="12.0"/>
+
+</joint>
+
+
+  <!-- ========================================================= -->
+  <!-- Right lower leg                                           -->
+  <!-- ========================================================= -->
+
+  <link name="right_lower_leg">
+
+    <visual>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.035 0.035 0.30"/>
+      </geometry>
+
+      <material name="lower_leg_color"/>
+    </visual>
+
+
+    <collision>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.035 0.035 0.30"/>
+      </geometry>
+    </collision>
+
+
+    <inertial>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+
+      <mass value="0.50"/>
+
+      <inertia
+        ixx="0.00382"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="0.00382"
+        iyz="0.0"
+        izz="0.00010"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- ========================================================= -->
+  <!-- Right knee                                                -->
+  <!-- ========================================================= -->
+
+  <joint name="right_knee_joint" type="revolute">
+
+    <parent link="right_upper_leg"/>
+    <child link="right_lower_leg"/>
+
+    <origin xyz="0 0 -0.30" rpy="0 0 0"/>
+
+    <axis xyz="0 1 0"/>
+
+    <limit
+      lower="-2.50"
+      upper="-0.50"
+      effort="100.0"
+      velocity="12.0"/>
+
+  </joint>
+
+
+  <!-- ========================================================= -->
+  <!-- Right wheel                                               -->
+  <!-- ========================================================= -->
+
+  <link name="right_wheel">
+
+    <visual>
+      <origin xyz="0 0 0" rpy="1.57079632679 0 0"/>
+
+      <geometry>
+        <cylinder
+          radius="0.10"
+          length="0.06"/>
+      </geometry>
+
+      <material name="wheel_color"/>
+    </visual>
+
+
+    <collision>
+      <origin xyz="0 0 0" rpy="1.57079632679 0 0"/>
+
+      <geometry>
+        <cylinder
+          radius="0.10"
+          length="0.06"/>
+      </geometry>
+    </collision>
+
+
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+
+      <mass value="0.35"/>
+
+      <inertia
+        ixx="0.00098"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="0.00175"
+        iyz="0.0"
+        izz="0.00098"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- ========================================================= -->
+  <!-- Right wheel joint                                         -->
+  <!-- ========================================================= -->
+
+  <joint name="right_wheel_joint" type="continuous">
+
+    <parent link="right_lower_leg"/>
+    <child link="right_wheel"/>
+
+    <origin xyz="0 0 -0.30" rpy="0 0 0"/>
+
+    <axis xyz="0 1 0"/>
+
+    <limit
+      effort="25.0"
+      velocity="100.0"/>
+
+  </joint>
+
+
+</robot>
