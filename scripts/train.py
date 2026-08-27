@@ -7,6 +7,8 @@ TASK_NAME = "WheelLeg-Move-Direct-v0"
 MODEL_NAME = "wheel_leg_move.onnx"
 NUM_ENVS = 256
 
+HEADLESS = False
+
 # None表示使用MovePPORunnerCfg.max_iterations；填写整数可临时覆盖。
 NUM_TRAINING_ITERATIONS = None
 RESUME_TRAINING = False
@@ -20,8 +22,28 @@ RESUME_CHECKPOINT_PATH = (
 )
 
 
+def get_available_model_path(model_path: Path) -> Path:
+    """返回不会覆盖已有文件的模型路径。
+
+    原路径不存在时直接使用；存在时依次尝试 ``name (1).onnx``、
+    ``name (2).onnx``，直到找到尚未使用的文件名。
+    """
+
+    if not model_path.exists():
+        return model_path
+
+    index = 1
+    while True:
+        candidate = model_path.with_name(
+            f"{model_path.stem} ({index}){model_path.suffix}"
+        )
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 # 训练时不打开GUI，减少渲染开销并提高并行仿真速度。
-app_launcher = AppLauncher(headless=True)
+app_launcher = AppLauncher(headless=HEADLESS)
 simulation_app = app_launcher.app
 
 
@@ -152,16 +174,20 @@ def main():
         runner.eval_mode()
 
         output_dir = project_root / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 保留已经导出的同名模型，自动为新模型添加递增序号。
+        output_model_path = get_available_model_path(output_dir / MODEL_NAME)
 
         export_policy_as_onnx(
             policy=runner.alg.policy,
             normalizer=runner.alg.policy.actor_obs_normalizer,
             path=str(output_dir),
-            filename=MODEL_NAME,
+            filename=output_model_path.name,
         )
 
         print(f"[PASS] Final PT model saved to: {final_checkpoint_path}")
-        print(f"[PASS] ONNX policy exported to: {output_dir / MODEL_NAME}")
+        print(f"[PASS] ONNX policy exported to: {output_model_path}")
 
     finally:
         if env is not None:

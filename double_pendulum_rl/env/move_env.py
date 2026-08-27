@@ -12,11 +12,12 @@ from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_from_euler_xyz, quat_mul
 
 from double_pendulum_rl.robot import ROBOT_CFG
+from double_pendulum_rl.utils import MoveEnvLogger, SustainedThresholdPenalty
 
 
 @configclass
 class MoveEnvCfg(DirectRLEnvCfg):
-    """移动、转向、腿高指令跟踪环境配置。"""
+    """移动、转向、腿长指令跟踪环境配置。"""
 
     # 时间参数
     decimation = 2  # 策略频率 120 / 2 = 60Hz
@@ -89,48 +90,82 @@ class MoveEnvCfg(DirectRLEnvCfg):
     initial_joint_velocity_noise = 0.05
 
     # 指令采样参数：
-    # [机体坐标系X方向速度, 绕机体Z轴角速度, 车身离地高度]
-    command_forward_velocity_range = (-0.5, 0.5)
+    # [机体坐标系X方向速度, 绕机体Z轴角速度, 髋到轮轴的腿长]
+    command_forward_velocity_range = (-1.5, 1.5)
     command_yaw_velocity_range = (-0.8, 0.8)
-    command_base_height_range = (0.50, 0.66)
+    # 第一阶段先使用较窄范围，避免策略通过长期蹲到最低来换取稳定。
+    # 学会可靠跟踪后再逐步扩大到最终训练范围。
+    command_leg_length_range = (0.30, 0.40)
     command_resampling_time_s = 3.0
     standing_command_probability = 0.15
 
     # 指令进入策略观测前的缩放参数
-    command_forward_obs_scale = 2.0
-    command_yaw_obs_scale = 1.0
-    command_height_obs_scale = 5.0
+    # 按当前采样范围缩放后，三维指令都大致位于[-1, 1]。
+    command_forward_obs_scale = 1.0 / 1.5
+    command_yaw_obs_scale = 1.0 / 0.8
+    command_leg_length_obs_scale = 10.0
 
-    # 终止参数。合法高度范围需要覆盖全部高度指令。
-    minimum_base_height = 0.38
+    # URDF中上下腿连杆长度，用于根据膝角计算髋到轮轴的实际距离。
+    upper_leg_length = 0.30
+    lower_leg_length = 0.30
+
+    # 终止参数。这里的高度只用于判断倒地或异常腾空，和腿长指令分开。
+    minimum_base_height = 0.25
     maximum_base_height = 0.78
     termination_gravity_z = -0.5
 
-    # 默认高度只用作高度指令观测的中心值，不是固定控制目标。
-    target_base_height = 0.584
+    # 腿长指令中心值，用于让第三维指令观测以零附近为中心。
+    target_leg_length = 0.35
 
     # 指令跟踪奖励权重和误差敏感度
     reward_forward_tracking = 2.0
     reward_yaw_tracking = 1.0
-    reward_height_tracking = 1.5
+    reward_leg_length_tracking = 3.0
     forward_tracking_error_scale = 4.0
     yaw_tracking_error_scale = 2.0
-    height_tracking_error_scale = 30.0
+    # 指数奖励负责目标附近的精细跟踪；适当减小尺度，避免远离目标时
+    # 奖励过早衰减到零。
+    leg_length_tracking_error_scale = 50.0
 
     # 平衡奖励与动作、安全惩罚
     reward_alive = 0.5
-    reward_upright = 2.0
+    reward_flat_orientation = 2.0
+    flat_orientation_error_scale = 5.0
     penalty_vertical_velocity = -0.2
     penalty_roll_pitch_velocity = -0.05
     penalty_leg_velocity = -0.005
     penalty_action = -0.002
     penalty_action_rate = -0.02
     penalty_joint_limit = -1.0
+    penalty_leg_symmetry = -2.0
+    penalty_leg_velocity_symmetry = -0.05
+    penalty_wheel_fore_aft_alignment = -2.0
+    # 连续超差惩罚：容差内使用普通惩罚倍率1；误差超出容差时，
+    # 倍率随连续超差时间线性增大。回到容差内后计时器立即清零。
+    # 累计时间上限用于防止奖励数值失控。
+    roll_pitch_error_tolerance = math.radians(5.0)
+    forward_velocity_error_tolerance = 0.10
+    yaw_velocity_error_tolerance = 0.10
+    leg_length_error_tolerance = 0.015
+    temporal_error_time_limit = 5.0
+    temporal_penalty_growth_per_second = 1.0
+
+    penalty_temporal_roll_pitch = -3.0
+    penalty_temporal_forward_velocity = -2.0
+    penalty_temporal_yaw_velocity = -1.0
+    penalty_temporal_leg_length = -20.0
+
+    # 在膝关节到达最小收缩或最大伸展限位前提前施加惩罚，防止策略
+    # 通过把膝盖长期顶在任一限位来换取稳定。
+    knee_flexion_limit_margin = 0.10
+    penalty_knee_flexion_limit = -1.0
+    knee_extension_limit_margin = 0.10
+    penalty_knee_extension_limit = -0.5
     penalty_termination = -5.0
 
 
 class MoveEnv(DirectRLEnv):
-    """在保持平衡的同时跟踪移动、转向和车身高度指令。"""
+    """在保持平衡的同时跟踪移动、转向和腿长指令。"""
 
     cfg: MoveEnvCfg
 
@@ -185,7 +220,7 @@ class MoveEnv(DirectRLEnv):
             device=self.device,
         )
 
-        # 每行依次为 [前向速度, 偏航角速度, 车身高度]。
+        # 每行依次为 [前向速度, 偏航角速度, 目标腿长]。
         self.commands = torch.zeros(
             (self.num_envs, 3), dtype=torch.float32, device=self.device
         )
@@ -193,6 +228,45 @@ class MoveEnv(DirectRLEnv):
         # 每个并行环境独立记录距离下一次指令采样的剩余时间。
         self.command_time_left = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
+        )
+
+        # 指令到期后先标记，在当前动作和奖励结算完成后再切换。
+        self.command_resample_pending = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+
+        # 四类误差分别使用独立的连续超阈值惩罚器。
+        common_penalty_args = {
+            "num_envs": self.num_envs,
+            "device": self.device,
+            "step_dt": self.step_dt,
+            "growth_per_second": self.cfg.temporal_penalty_growth_per_second,
+            "max_accumulation_time": self.cfg.temporal_error_time_limit,
+        }
+        self.roll_pitch_penalty = SustainedThresholdPenalty(
+            tolerance=self.cfg.roll_pitch_error_tolerance,
+            **common_penalty_args,
+        )
+        self.forward_velocity_penalty = SustainedThresholdPenalty(
+            tolerance=self.cfg.forward_velocity_error_tolerance,
+            **common_penalty_args,
+        )
+        self.yaw_velocity_penalty = SustainedThresholdPenalty(
+            tolerance=self.cfg.yaw_velocity_error_tolerance,
+            **common_penalty_args,
+        )
+        self.leg_length_penalty = SustainedThresholdPenalty(
+            tolerance=self.cfg.leg_length_error_tolerance,
+            **common_penalty_args,
+        )
+
+        # 日志类只负责汇总诊断指标，不参与环境状态和奖励计算。
+        self.logger = MoveEnvLogger(
+            cfg=self.cfg,
+            roll_pitch_penalty=self.roll_pitch_penalty,
+            forward_velocity_penalty=self.forward_velocity_penalty,
+            yaw_velocity_penalty=self.yaw_velocity_penalty,
+            leg_length_penalty=self.leg_length_penalty,
         )
 
     def _setup_scene(self):
@@ -226,28 +300,44 @@ class MoveEnv(DirectRLEnv):
 
         count = env_ids.numel()
 
-        # 为指定环境分别采样前向速度、偏航角速度和车身高度。
-        self.commands[env_ids, 0].uniform_(
+        # 先在连续张量中采样，再一次性写回commands。
+        # 不能直接调用self.commands[env_ids, column].uniform_()：env_ids
+        # 属于高级索引，该表达式返回临时副本，原commands不会被修改。
+        sampled_commands = torch.empty(
+            (count, 3),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        sampled_commands[:, 0].uniform_(
             *self.cfg.command_forward_velocity_range
         )
-        self.commands[env_ids, 1].uniform_(
+        sampled_commands[:, 1].uniform_(
             *self.cfg.command_yaw_velocity_range
         )
-        self.commands[env_ids, 2].uniform_(
-            *self.cfg.command_base_height_range
+        sampled_commands[:, 2].uniform_(
+            *self.cfg.command_leg_length_range
         )
 
         # 保留一定比例的原地指令，确保策略能学习零速度下稳定站立。
-        # 此处只清零速度和转向，高度指令仍然有效，因此也会训练
+        # 此处只清零速度和转向，腿长指令仍然有效，因此也会训练
         # 原地伸腿和原地缩腿。
         standing = (
             torch.rand(count, device=self.device)
             < self.cfg.standing_command_probability
         )
-        self.commands[env_ids[standing], 0:2] = 0.0
+        sampled_commands[standing, 0:2] = 0.0
+
+        # 高级索引放在赋值左侧时会正确写回原张量。
+        self.commands[env_ids] = sampled_commands
 
         # 重置这些环境的指令倒计时。
         self.command_time_left[env_ids] = self.cfg.command_resampling_time_s
+
+        # 新指令开始时重新计算“连续未跟随”的持续时间，避免把上一条
+        # 指令的超差历史带到当前指令。姿态计时器不受指令切换影响。
+        self.forward_velocity_penalty.reset(env_ids)
+        self.yaw_velocity_penalty.reset(env_ids)
+        self.leg_length_penalty.reset(env_ids)
 
     def _pre_physics_step(self, actions):
         # 先保存旧动作，奖励函数需要计算相邻动作的变化量。
@@ -270,12 +360,10 @@ class MoveEnv(DirectRLEnv):
             )
         )
 
-        # 每个策略步减少一次倒计时；到期环境立即采样新指令。
+        # 每个策略步减少一次倒计时。这里只标记到期环境，不能立即
+        # 切换命令，否则本步动作基于旧命令、奖励却会按新命令计算。
         self.command_time_left -= self.step_dt
-        resample_ids = torch.nonzero(
-            self.command_time_left <= 0.0, as_tuple=False
-        ).squeeze(-1)
-        self._sample_commands(resample_ids)
+        self.command_resample_pending |= self.command_time_left <= 0.0
 
     def _apply_action(self):
         # 清空上一物理步缓存的关节力矩。
@@ -327,14 +415,14 @@ class MoveEnv(DirectRLEnv):
             dim=-1,
         )
 
-        # 新增3维指令观测：前向速度、偏航角速度、目标高度偏差。
-        # 高度减去默认高度后再缩放，使输入以零附近为中心。
+        # 新增3维指令观测：前向速度、偏航角速度、目标腿长偏差。
+        # 腿长减去指令中心值后再缩放，使输入以零附近为中心。
         command_obs = torch.stack(
             (
                 self.commands[:, 0] * self.cfg.command_forward_obs_scale,
                 self.commands[:, 1] * self.cfg.command_yaw_obs_scale,
-                (self.commands[:, 2] - self.cfg.target_base_height)
-                * self.cfg.command_height_obs_scale,
+                (self.commands[:, 2] - self.cfg.target_leg_length)
+                * self.cfg.command_leg_length_obs_scale,
             ),
             dim=-1,
         )
@@ -384,6 +472,15 @@ class MoveEnv(DirectRLEnv):
         invalid_state |= ~torch.isfinite(self.robot.data.joint_pos).all(dim=1)
         invalid_state |= ~torch.isfinite(self.robot.data.joint_vel).all(dim=1)
 
+        # 保存各类终止原因，供奖励阶段写入TensorBoard诊断日志。
+        self.termination_reasons = {
+            "too_low": too_low,
+            "too_high": too_high,
+            "too_tilted": too_tilted,
+            "illegal_contact": illegal_contact,
+            "invalid_state": invalid_state,
+        }
+
         terminated = too_low | too_high | too_tilted | invalid_state
         terminated |= illegal_contact
 
@@ -395,33 +492,84 @@ class MoveEnv(DirectRLEnv):
         # 所有速度均使用车身坐标系，前进方向固定为机体X轴。
         lin_vel = self.robot.data.root_lin_vel_b
         ang_vel = self.robot.data.root_ang_vel_b
-        gravity_z = self.robot.data.projected_gravity_b[:, 2]
-        base_height = (
-            self.robot.data.root_pos_w[:, 2] - self.scene.env_origins[:, 2]
-        )
+        projected_gravity = self.robot.data.projected_gravity_b
         leg_pos = self.robot.data.joint_pos[:, self.leg_joint_ids]
         leg_vel = self.robot.data.joint_vel[:, self.leg_joint_ids]
+
+        forward_velocity_error = lin_vel[:, 0] - self.commands[:, 0]
+        yaw_velocity_error = ang_vel[:, 2] - self.commands[:, 1]
 
         # 前向速度越接近指令，奖励越接近1。
         forward_tracking = torch.exp(
             -self.cfg.forward_tracking_error_scale
-            * (lin_vel[:, 0] - self.commands[:, 0]).square()
+            * forward_velocity_error.square()
         )
 
         # 绕车身Z轴的角速度越接近偏航指令，奖励越接近1。
         yaw_tracking = torch.exp(
             -self.cfg.yaw_tracking_error_scale
-            * (ang_vel[:, 2] - self.commands[:, 1]).square()
+            * yaw_velocity_error.square()
         )
 
-        # 车身高度越接近伸缩腿指令，奖励越接近1。
-        height_tracking = torch.exp(
-            -self.cfg.height_tracking_error_scale
-            * (base_height - self.commands[:, 2]).square()
+        # 根据余弦定理分别计算左右腿从髋关节到轮轴的真实长度。
+        # leg_pos顺序为[左髋, 右髋, 左膝, 右膝]，腿长只由膝角决定。
+        knee_pos = leg_pos[:, 2:4]
+        leg_length_squared = (
+            self.cfg.upper_leg_length**2
+            + self.cfg.lower_leg_length**2
+            + 2.0
+            * self.cfg.upper_leg_length
+            * self.cfg.lower_leg_length
+            * torch.cos(knee_pos)
+        )
+        leg_lengths = torch.sqrt(torch.clamp(leg_length_squared, min=0.0))
+
+        # 先计算左右腿平均长度，再让平均腿长跟踪第三维指令。
+        # 左右腿之间的长度和姿态差异由后面的对称惩罚单独约束。
+        average_leg_length = torch.mean(leg_lengths, dim=1)
+        leg_length_error = (
+            average_leg_length - self.commands[:, 2]
+        ).square()
+        leg_length_tracking = torch.exp(
+            -self.cfg.leg_length_tracking_error_scale
+            * leg_length_error
         )
 
-        # 完全直立时gravity_z约为-1，upright约为1。
-        upright = torch.clamp(-gravity_z, 0.0, 1.0).square()
+        # 根据车身坐标系中的重力方向明确计算roll和pitch。
+        # 完全正直时二者都为0；这里只约束横滚和俯仰，不约束偏航，
+        # 因此机器人仍然可以按照偏航角速度指令正常旋转。
+        gravity_x = projected_gravity[:, 0]
+        gravity_y = projected_gravity[:, 1]
+        gravity_z = projected_gravity[:, 2]
+        roll = torch.atan2(gravity_y, -gravity_z)
+        pitch = torch.atan2(
+            -gravity_x,
+            torch.sqrt(gravity_y.square() + gravity_z.square()),
+        )
+        roll_pitch_angle_error = roll.square() + pitch.square()
+
+        # 分别更新姿态、前向速度、偏航速度和腿长的连续超差时间。
+        # 每一项独立计时：某一指令已跟随成功时，不会因为其他指令
+        # 仍超差而继续增加该项惩罚。
+        roll_pitch_penalty_multiplier = self.roll_pitch_penalty.update(
+            torch.sqrt(roll_pitch_angle_error)
+        )
+        forward_velocity_penalty_multiplier = (
+            self.forward_velocity_penalty.update(
+                torch.abs(forward_velocity_error)
+            )
+        )
+        yaw_velocity_penalty_multiplier = self.yaw_velocity_penalty.update(
+            torch.abs(yaw_velocity_error)
+        )
+        leg_length_penalty_multiplier = self.leg_length_penalty.update(
+            torch.sqrt(leg_length_error)
+        )
+
+        # roll和pitch越接近0，车体正直奖励越接近1。
+        flat_orientation = torch.exp(
+            -self.cfg.flat_orientation_error_scale * roll_pitch_angle_error
+        )
 
         # 未因失败条件终止时获得存活奖励。
         alive = (~self.reset_terminated).float()
@@ -443,12 +591,67 @@ class MoveEnv(DirectRLEnv):
             (self.actions - self.previous_actions).square(), dim=1
         )
 
+        # 惩罚左右髋和左右膝姿态差异，避免两条腿前后劈叉。
+        leg_symmetry_error = (
+            (leg_pos[:, 0] - leg_pos[:, 1]).square()
+            + (leg_pos[:, 2] - leg_pos[:, 3]).square()
+        )
+
+        # 同时约束左右腿的运动速度，减少一条腿向前、另一条腿向后。
+        leg_velocity_symmetry_error = (
+            (leg_vel[:, 0] - leg_vel[:, 1]).square()
+            + (leg_vel[:, 2] - leg_vel[:, 3]).square()
+        )
+
+        # 根据两连杆运动学计算左右轮轴相对于各自髋关节的前后位置。
+        # 左右轮轴X坐标接近时，两条腿不会一条向前、一条向后劈开。
+        hip_pos = leg_pos[:, 0:2]
+        wheel_fore_aft_pos = (
+            -self.cfg.upper_leg_length * torch.sin(hip_pos)
+            - self.cfg.lower_leg_length * torch.sin(hip_pos + knee_pos)
+        )
+        wheel_fore_aft_alignment_error = (
+            wheel_fore_aft_pos[:, 0] - wheel_fore_aft_pos[:, 1]
+        ).square()
+
         # 关节超过软限位时进行惩罚。
         leg_limits = self.robot.data.soft_joint_pos_limits[:, self.leg_joint_ids]
         lower_error = torch.clamp(leg_limits[:, :, 0] - leg_pos, min=0.0)
         upper_error = torch.clamp(leg_pos - leg_limits[:, :, 1], min=0.0)
         joint_limit_error = torch.sum(
             lower_error.square() + upper_error.square(), dim=1
+        )
+
+        # 普通joint_limit只在超过软限位后生效；下面两项分别在膝关节
+        # 接近最小收缩和最大伸展限位时提前增加，避免策略顶住限位。
+        knee_limits = self.robot.data.soft_joint_pos_limits[
+            :, self.knee_joint_ids
+        ]
+        knee_flexion_limit_error = torch.sum(
+            torch.clamp(
+                (
+                    knee_limits[:, :, 0]
+                    + self.cfg.knee_flexion_limit_margin
+                    - knee_pos
+                )
+                / self.cfg.knee_flexion_limit_margin,
+                min=0.0,
+            ).square(),
+            dim=1,
+        )
+        knee_extension_limit_error = torch.sum(
+            torch.clamp(
+                (
+                    knee_pos
+                    - (
+                        knee_limits[:, :, 1]
+                        - self.cfg.knee_extension_limit_margin
+                    )
+                )
+                / self.cfg.knee_extension_limit_margin,
+                min=0.0,
+            ).square(),
+            dim=1,
         )
 
         # 普通奖励按step_dt缩放，减少策略频率变化对总奖励量级的影响。
@@ -459,10 +662,28 @@ class MoveEnv(DirectRLEnv):
             "yaw_tracking": yaw_tracking
             * self.cfg.reward_yaw_tracking
             * self.step_dt,
-            "height_tracking": height_tracking
-            * self.cfg.reward_height_tracking
+            "leg_length_tracking": leg_length_tracking
+            * self.cfg.reward_leg_length_tracking
             * self.step_dt,
-            "upright": upright * self.cfg.reward_upright * self.step_dt,
+            "temporal_roll_pitch": roll_pitch_angle_error
+            * roll_pitch_penalty_multiplier
+            * self.cfg.penalty_temporal_roll_pitch
+            * self.step_dt,
+            "temporal_forward_velocity": forward_velocity_error.square()
+            * forward_velocity_penalty_multiplier
+            * self.cfg.penalty_temporal_forward_velocity
+            * self.step_dt,
+            "temporal_yaw_velocity": yaw_velocity_error.square()
+            * yaw_velocity_penalty_multiplier
+            * self.cfg.penalty_temporal_yaw_velocity
+            * self.step_dt,
+            "temporal_leg_length": leg_length_error
+            * leg_length_penalty_multiplier
+            * self.cfg.penalty_temporal_leg_length
+            * self.step_dt,
+            "flat_orientation": flat_orientation
+            * self.cfg.reward_flat_orientation
+            * self.step_dt,
             "alive": alive * self.cfg.reward_alive * self.step_dt,
             "vertical_velocity": vertical_velocity_error
             * self.cfg.penalty_vertical_velocity
@@ -480,13 +701,56 @@ class MoveEnv(DirectRLEnv):
             "joint_limit": joint_limit_error
             * self.cfg.penalty_joint_limit
             * self.step_dt,
+            "knee_flexion_limit": knee_flexion_limit_error
+            * self.cfg.penalty_knee_flexion_limit
+            * self.step_dt,
+            "knee_extension_limit": knee_extension_limit_error
+            * self.cfg.penalty_knee_extension_limit
+            * self.step_dt,
+            "leg_symmetry": leg_symmetry_error
+            * self.cfg.penalty_leg_symmetry
+            * self.step_dt,
+            "leg_velocity_symmetry": leg_velocity_symmetry_error
+            * self.cfg.penalty_leg_velocity_symmetry
+            * self.step_dt,
+            "wheel_fore_aft_alignment": wheel_fore_aft_alignment_error
+            * self.cfg.penalty_wheel_fore_aft_alignment
+            * self.step_dt,
             # 倒下是瞬时事件，不乘step_dt。
             "termination": self.reset_terminated.float()
             * self.cfg.penalty_termination,
         }
 
+        # 把本步数据交给独立日志类，环境内不再展开具体指标定义。
+        self.extras["log"] = self.logger.build(
+            commands=self.commands,
+            linear_velocity=lin_vel,
+            angular_velocity=ang_vel,
+            average_leg_length=average_leg_length,
+            roll=roll,
+            pitch=pitch,
+            forward_velocity_error=forward_velocity_error,
+            yaw_velocity_error=yaw_velocity_error,
+            leg_length_error=leg_length_error,
+            roll_pitch_angle_error=roll_pitch_angle_error,
+            actions=self.actions,
+            knee_flexion_limit_error=knee_flexion_limit_error,
+            knee_extension_limit_error=knee_extension_limit_error,
+            reset_terminated=self.reset_terminated,
+            termination_reasons=self.termination_reasons,
+            rewards=rewards,
+        )
+
         # 汇总所有奖励项，并阻止异常值传入训练器。
         total = torch.sum(torch.stack(list(rewards.values())), dim=0)
+
+        # 当前动作和奖励已经按旧命令结算完成。现在切换到期命令，
+        # 随后的_get_observations()会把新命令交给下一次策略决策。
+        resample_mask = self.command_resample_pending & ~self.reset_terminated
+        resample_ids = torch.nonzero(resample_mask, as_tuple=False).squeeze(-1)
+        self.command_resample_pending.zero_()
+        self._sample_commands(resample_ids)
+
         return torch.nan_to_num(
             total,
             nan=self.cfg.penalty_termination,
@@ -508,6 +772,13 @@ class MoveEnv(DirectRLEnv):
         self.actions[env_ids] = 0.0
         self.previous_actions[env_ids] = 0.0
         self.joint_efforts[env_ids] = 0.0
+        self.command_resample_pending[env_ids] = False
+
+        # 新episode不继承上一次失败前累计的超差时间。
+        self.roll_pitch_penalty.reset(env_ids)
+        self.forward_velocity_penalty.reset(env_ids)
+        self.yaw_velocity_penalty.reset(env_ids)
+        self.leg_length_penalty.reset(env_ids)
 
         # 将零力矩写入仿真，防止重置前的力矩残留。
         self.robot.set_joint_effort_target(
@@ -577,5 +848,5 @@ class MoveEnv(DirectRLEnv):
             joint_pos, joint_vel, env_ids=env_ids
         )
 
-        # 为新episode采样第一条移动、转向和高度指令。
+        # 为新episode采样第一条移动、转向和腿长指令。
         self._sample_commands(env_ids)
