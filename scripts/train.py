@@ -1,14 +1,32 @@
 from isaaclab.app import AppLauncher
+from pathlib import Path
 
 
-# 训练时不打开GUI。
-app_launcher = AppLauncher(headless=False)
+# 训练参数
+TASK_NAME = "WheelLeg-Move-Direct-v0"
+MODEL_NAME = "wheel_leg_move.onnx"
+NUM_ENVS = 256
+
+# None表示使用MovePPORunnerCfg.max_iterations；填写整数可临时覆盖。
+NUM_TRAINING_ITERATIONS = None
+RESUME_TRAINING = False
+RESUME_CHECKPOINT_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "logs"
+    / "rsl_rl"
+    / "wheel_leg_balance_direct"
+    / "2026-08-26_21-17-09"
+    / "model_700.pt"
+)
+
+
+# 训练时不打开GUI，减少渲染开销并提高并行仿真速度。
+app_launcher = AppLauncher(headless=True)
 simulation_app = app_launcher.app
 
 
 # Isaac Lab相关模块必须在AppLauncher之后导入。
 from datetime import datetime
-from pathlib import Path
 
 import gymnasium as gym
 
@@ -19,22 +37,8 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper, export_policy_as_onnx
 from isaaclab_tasks.utils import load_cfg_from_registry
 
 # 导入根包，执行Gym任务注册。
-import double_pendulum_rl  
+import double_pendulum_rl
 
-# 训练参数
-TASK_NAME = "WheelLeg-Balance-Direct-v0"
-MODEL_NAME = "wheel_leg_balance.onnx"
-NUM_ENVS = 256
-NUM_TRAINING_ITERATIONS = 1000
-RESUME_TRAINING = False
-RESUME_CHECKPOINT_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "logs"
-    / "rsl_rl"
-    / "wheel_leg_balance_direct"
-    / "2026-08-26_21-17-09"
-    / "model_700.pt"
-)
 
 def main():
     env = None
@@ -52,7 +56,7 @@ def main():
             "rsl_rl_cfg_entry_point",
         )
 
-        # 第一轮只创建16个环境。
+        # 使用训练脚本顶部配置的并行环境数量。
         env_cfg.scene.num_envs = NUM_ENVS
 
         # 环境、物理仿真和PPO网络使用相同设备。
@@ -92,7 +96,13 @@ def main():
         print(f"[INFO] Number of environments: {env.num_envs}")
         print(f"[INFO] Training device: {agent_cfg.device}")
         print(f"[INFO] Log directory: {log_dir}")
-        print(f"[INFO] Training iterations: {NUM_TRAINING_ITERATIONS}")
+        training_iterations = (
+            agent_cfg.max_iterations
+            if NUM_TRAINING_ITERATIONS is None
+            else NUM_TRAINING_ITERATIONS
+        )
+
+        print(f"[INFO] Training iterations: {training_iterations}")
 
         # 保存本次训练使用的配置。
         dump_yaml(
@@ -129,7 +139,7 @@ def main():
 
         # 开始训练。
         runner.learn(
-            num_learning_iterations=(NUM_TRAINING_ITERATIONS),
+            num_learning_iterations=training_iterations,
             init_at_random_ep_len=True,
         )
 
