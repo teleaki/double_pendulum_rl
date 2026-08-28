@@ -15,7 +15,6 @@ MODEL_PATH = (
     Path(__file__).resolve().parents[1] / "output" / "wheel_leg_move.onnx"
 )
 NUM_ENVS = 1
-NUM_STEPS = 3600
 PRINT_INTERVAL = 60
 SEED = 42
 
@@ -24,9 +23,17 @@ RENDER_MODE = None if HEADLESS else "human"
 CAMERA_EYE = (3.0, 3.0, 1.8)
 CAMERA_TARGET = (0.0, 0.0, 0.5)
 
-# Move环境固定指令：[前向速度m/s, 偏航角速度rad/s, 腿长m]。
+# Move环境初始指令：[前向速度m/s, 偏航角速度rad/s, 腿长m]。
 # None表示使用训练时的随机指令；播放Balance模型时必须设为None。
-FIXED_COMMAND = (0.3, 0.0, 0.30)
+FIXED_COMMAND = (0.0, 0.0, 0.35)
+
+# GUI播放Move模型时启用键盘实时指令。速度范围与当前训练范围一致。
+KEYBOARD_CONTROL = True
+FORWARD_SPEED = 0.8
+FAST_FORWARD_SPEED = 1.5
+YAW_SPEED = 0.4
+FAST_YAW_SPEED = 0.8
+LEG_LENGTH_RATE = 0.05  # 按住U/J时每秒伸缩的米数
 
 
 # Isaac Lab相关模块必须在AppLauncher之后导入。
@@ -38,6 +45,8 @@ import gymnasium as gym
 import numpy as np
 import onnxruntime as ort
 import torch
+import carb
+import omni.appwindow
 
 # 导入根包以注册所有Gym任务。
 import double_pendulum_rl  # noqa: F401
@@ -127,36 +136,143 @@ def run_policy(
     return torch.clamp(actions, -1.0, 1.0)
 
 
-def apply_fixed_command(base_env):
-    """给命令式环境的全部并行机器人写入同一条固定指令。"""
+def apply_command(base_env, command):
+    """给命令式环境的全部并行机器人写入同一条指令。"""
 
-    if FIXED_COMMAND is None:
+    if command is None:
         return
     if not hasattr(base_env, "commands"):
         raise RuntimeError(
             "FIXED_COMMAND is only supported by command-based environments. "
             "Set FIXED_COMMAND=None for Balance."
         )
-    if len(FIXED_COMMAND) != base_env.commands.shape[1]:
+    if len(command) != base_env.commands.shape[1]:
         raise RuntimeError(
             f"Expected {base_env.commands.shape[1]} command values, "
-            f"got {len(FIXED_COMMAND)}"
+            f"got {len(command)}"
         )
 
-    command = torch.tensor(
-        FIXED_COMMAND,
+    command_tensor = torch.tensor(
+        command,
         dtype=torch.float32,
         device=base_env.device,
     )
-    base_env.commands[:] = command
+    base_env.commands[:] = command_tensor
 
     # 禁止MoveEnv在播放过程中按训练周期重新随机采样指令。
     if hasattr(base_env, "command_time_left"):
         base_env.command_time_left.fill_(float("inf"))
 
 
+class KeyboardCommandController:
+    """把键盘按键状态转换为MoveEnv的三维运动指令。"""
+
+    def __init__(self, initial_command, leg_length_range):
+        if initial_command is None:
+            raise ValueError("Keyboard control requires a non-None FIXED_COMMAND.")
+
+        self.initial_command = tuple(initial_command)
+        self.command = list(self.initial_command)
+        self.leg_length_min, self.leg_length_max = leg_length_range
+        self.pressed_keys = set()
+        self.reset_requested = False
+
+        app_window = omni.appwindow.get_default_app_window()
+        self.keyboard = app_window.get_keyboard()
+        self.input_interface = carb.input.acquire_input_interface()
+        self.subscription = self.input_interface.subscribe_to_keyboard_events(
+            self.keyboard,
+            self._on_keyboard_event,
+        )
+
+    def _on_keyboard_event(self, event, *args):
+        controlled_keys = {
+            carb.input.KeyboardInput.W,
+            carb.input.KeyboardInput.S,
+            carb.input.KeyboardInput.A,
+            carb.input.KeyboardInput.D,
+            carb.input.KeyboardInput.R,
+            carb.input.KeyboardInput.U,
+            carb.input.KeyboardInput.J,
+        }
+        if event.input not in controlled_keys:
+            return True
+
+        if (
+            event.input == carb.input.KeyboardInput.R
+            and event.type == carb.input.KeyboardEventType.KEY_PRESS
+        ):
+            self.reset_requested = True
+        elif event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            self.pressed_keys.add(event.input)
+        elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
+            self.pressed_keys.discard(event.input)
+        return True
+
+    def _control_pressed(self):
+        """读取左右Ctrl当前状态，用于切换高速档。"""
+
+        left = self.input_interface.get_keyboard_value(
+            self.keyboard,
+            carb.input.KeyboardInput.LEFT_CONTROL,
+        )
+        right = self.input_interface.get_keyboard_value(
+            self.keyboard,
+            carb.input.KeyboardInput.RIGHT_CONTROL,
+        )
+        return bool(left or right)
+
+    def update(self, step_dt):
+        """按当前按键状态更新并返回一条三维指令。"""
+
+        fast = self._control_pressed()
+        forward_speed = FAST_FORWARD_SPEED if fast else FORWARD_SPEED
+        yaw_speed = FAST_YAW_SPEED if fast else YAW_SPEED
+
+        forward_direction = int(
+            carb.input.KeyboardInput.W in self.pressed_keys
+        ) - int(carb.input.KeyboardInput.S in self.pressed_keys)
+        yaw_direction = int(
+            carb.input.KeyboardInput.A in self.pressed_keys
+        ) - int(carb.input.KeyboardInput.D in self.pressed_keys)
+
+        self.command[0] = forward_direction * forward_speed
+        self.command[1] = yaw_direction * yaw_speed
+
+        leg_direction = int(
+            carb.input.KeyboardInput.U in self.pressed_keys
+        ) - int(carb.input.KeyboardInput.J in self.pressed_keys)
+        self.command[2] = float(
+            np.clip(
+                self.command[2] + leg_direction * LEG_LENGTH_RATE * step_dt,
+                self.leg_length_min,
+                self.leg_length_max,
+            )
+        )
+        return tuple(self.command)
+
+    def consume_reset_request(self):
+        """读取一次手动重置请求，并把控制指令恢复为初始值。"""
+
+        if not self.reset_requested:
+            return False
+        self.reset_requested = False
+        self.command = list(self.initial_command)
+        self.pressed_keys.clear()
+        return True
+
+    def close(self):
+        """取消键盘事件订阅。"""
+
+        self.input_interface.unsubscribe_to_keyboard_events(
+            self.keyboard,
+            self.subscription,
+        )
+
+
 def main():
     env = None
+    keyboard_controller = None
 
     try:
         # 根据任务注册信息自动加载BalanceEnvCfg或MoveEnvCfg。
@@ -164,6 +280,18 @@ def main():
         env_cfg.scene.num_envs = NUM_ENVS
         env_cfg.scene.clone_in_fabric = False
         env_cfg.seed = SEED
+
+        # 播放时不按episode时长、跌倒、倾斜或接触条件自动重置。
+        # 数值出现NaN/Inf时仍保留环境自身的安全重置。
+        env_cfg.episode_length_s = 1.0e9
+        if hasattr(env_cfg, "minimum_base_height"):
+            env_cfg.minimum_base_height = -float("inf")
+        if hasattr(env_cfg, "maximum_base_height"):
+            env_cfg.maximum_base_height = float("inf")
+        if hasattr(env_cfg, "termination_gravity_z"):
+            env_cfg.termination_gravity_z = 2.0
+        if hasattr(env_cfg, "illegal_contact_force_threshold"):
+            env_cfg.illegal_contact_force_threshold = float("inf")
 
         env = gym.make(TASK_NAME, cfg=env_cfg, render_mode=RENDER_MODE)
         base_env = env.unwrapped
@@ -182,7 +310,22 @@ def main():
             )
 
         observations, _ = env.reset()
-        apply_fixed_command(base_env)
+
+        if KEYBOARD_CONTROL:
+            if HEADLESS:
+                raise RuntimeError("Keyboard control requires HEADLESS=False.")
+            if not hasattr(base_env, "commands"):
+                raise RuntimeError(
+                    "Keyboard control is only supported by MoveEnv. "
+                    "Set KEYBOARD_CONTROL=False when playing BalanceEnv."
+                )
+            keyboard_controller = KeyboardCommandController(
+                initial_command=FIXED_COMMAND,
+                leg_length_range=base_env.cfg.command_leg_length_range,
+            )
+
+        active_command = FIXED_COMMAND
+        apply_command(base_env, active_command)
 
         # reset()返回的观测可能仍包含随机指令；覆盖指令后重新生成观测。
         policy_observations = base_env._get_observations()["policy"]
@@ -194,18 +337,40 @@ def main():
         print(f"[INFO] Device: {base_env.device}")
         print(f"[INFO] Observation shape: {tuple(policy_observations.shape)}")
         print(f"[INFO] Policy frequency: {1.0 / base_env.step_dt:.1f} Hz")
-        print(f"[INFO] Fixed command: {FIXED_COMMAND}")
+        print(f"[INFO] Initial command: {FIXED_COMMAND}")
+        if keyboard_controller is not None:
+            print("[CONTROL] W/S: +0.8/-0.8 m/s")
+            print("[CONTROL] Ctrl+W/S: +1.5/-1.5 m/s")
+            print("[CONTROL] A/D: counterclockwise/clockwise at 0.4 rad/s")
+            print("[CONTROL] Ctrl+A/D: counterclockwise/clockwise at 0.8 rad/s")
+            print("[CONTROL] Hold U/J: extend/retract legs")
+            print("[CONTROL] R: reset robot")
 
         total_terminated = 0
         total_time_outs = 0
 
-        for step in range(1, NUM_STEPS + 1):
-            if not simulation_app.is_running():
-                break
+        step = 0
+        while simulation_app.is_running():
+            step += 1
 
-            # 自动重置或定时采样后重新覆盖固定指令和对应观测。
-            if FIXED_COMMAND is not None:
-                apply_fixed_command(base_env)
+            # 只在用户按R时主动重置机器人和控制指令。
+            if (
+                keyboard_controller is not None
+                and keyboard_controller.consume_reset_request()
+            ):
+                observations, _ = env.reset()
+                active_command = tuple(keyboard_controller.command)
+                apply_command(base_env, active_command)
+                policy_observations = base_env._get_observations()["policy"]
+                print("[INFO] Manual reset: robot and command were reset.")
+
+            # 根据键盘状态生成实时指令；未启用键盘时保持固定指令。
+            if keyboard_controller is not None:
+                active_command = keyboard_controller.update(base_env.step_dt)
+
+            # 每步覆盖实时指令，并重新生成包含该指令的策略观测。
+            if active_command is not None:
+                apply_command(base_env, active_command)
                 policy_observations = base_env._get_observations()["policy"]
 
             actions = run_policy(
@@ -237,6 +402,11 @@ def main():
                     .cpu()
                     .tolist()
                 )
+                command_values = (
+                    list(active_command)
+                    if active_command is not None
+                    else base_env.commands[0].detach().cpu().tolist()
+                )
                 action_values = actions[0].detach().cpu().tolist()
 
                 print(
@@ -244,6 +414,7 @@ def main():
                     f"height_mean={base_height.mean().item():.4f} "
                     f"reward_mean={rewards.mean().item():.4f} "
                     f"gravity_0={[round(x, 3) for x in gravity]} "
+                    f"command={[round(x, 3) for x in command_values]} "
                     f"action_0={[round(x, 3) for x in action_values]} "
                     f"terminated={terminated_count} "
                     f"time_out={time_out_count}"
@@ -254,6 +425,8 @@ def main():
         print(f"[INFO] Time-out resets: {total_time_outs}")
 
     finally:
+        if keyboard_controller is not None:
+            keyboard_controller.close()
         if env is not None:
             env.close()
 
