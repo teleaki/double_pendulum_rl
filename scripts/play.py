@@ -7,28 +7,19 @@ from isaaclab.app import AppLauncher
 # 播放配置
 # ------------------------------------------------------------
 
-# 任务和模型必须匹配：
-# Balance：WheelLeg-Balance-Direct-v0 + wheel_leg_balance.onnx
-# Move：   WheelLeg-Move-Direct-v0    + wheel_leg_move.onnx
 TASK_NAME = "WheelLeg-Move-Direct-v0"
-MODEL_PATH = (
-    Path(__file__).resolve().parents[1] / "output" / "wheel_leg_move.onnx"
-)
+MODEL_PATH = Path(__file__).resolve().parents[1] / "output" / "wheel_leg_move.onnx"
 NUM_ENVS = 1
 PRINT_INTERVAL = 60
 SEED = 42
-
 HEADLESS = False
+INITIAL_COMMAND = (0.0, 0.0, 0.35)
+KEYBOARD_CONTROL = True
 RENDER_MODE = None if HEADLESS else "human"
 CAMERA_EYE = (3.0, 3.0, 1.8)
 CAMERA_TARGET = (0.0, 0.0, 0.5)
 
-# Move环境初始指令：[前向速度m/s, 偏航角速度rad/s, 腿长m]。
-# None表示使用训练时的随机指令；播放Balance模型时必须设为None。
-FIXED_COMMAND = (0.0, 0.0, 0.35)
-
-# GUI播放Move模型时启用键盘实时指令。速度范围与当前训练范围一致。
-KEYBOARD_CONTROL = True
+# GUI下可使用键盘更新项目统一的三维指令。
 FORWARD_SPEED = 0.8
 FAST_FORWARD_SPEED = 1.5
 YAW_SPEED = 0.4
@@ -141,11 +132,6 @@ def apply_command(base_env, command):
 
     if command is None:
         return
-    if not hasattr(base_env, "commands"):
-        raise RuntimeError(
-            "FIXED_COMMAND is only supported by command-based environments. "
-            "Set FIXED_COMMAND=None for Balance."
-        )
     if len(command) != base_env.commands.shape[1]:
         raise RuntimeError(
             f"Expected {base_env.commands.shape[1]} command values, "
@@ -159,17 +145,17 @@ def apply_command(base_env, command):
     )
     base_env.commands[:] = command_tensor
 
-    # 禁止MoveEnv在播放过程中按训练周期重新随机采样指令。
+    # 播放过程中保持外部给定的指令，不按训练周期重新采样。
     if hasattr(base_env, "command_time_left"):
         base_env.command_time_left.fill_(float("inf"))
 
 
 class KeyboardCommandController:
-    """把键盘按键状态转换为MoveEnv的三维运动指令。"""
+    """把键盘按键状态转换为项目标准三维指令。"""
 
     def __init__(self, initial_command, leg_length_range):
         if initial_command is None:
-            raise ValueError("Keyboard control requires a non-None FIXED_COMMAND.")
+            raise ValueError("Keyboard control requires an initial command.")
 
         self.initial_command = tuple(initial_command)
         self.command = list(self.initial_command)
@@ -275,7 +261,7 @@ def main():
     keyboard_controller = None
 
     try:
-        # 根据任务注册信息自动加载BalanceEnvCfg或MoveEnvCfg。
+        # 根据任务注册信息自动加载环境配置。
         env_cfg = load_cfg_from_registry(TASK_NAME, "env_cfg_entry_point")
         env_cfg.scene.num_envs = NUM_ENVS
         env_cfg.scene.clone_in_fabric = False
@@ -314,17 +300,12 @@ def main():
         if KEYBOARD_CONTROL:
             if HEADLESS:
                 raise RuntimeError("Keyboard control requires HEADLESS=False.")
-            if not hasattr(base_env, "commands"):
-                raise RuntimeError(
-                    "Keyboard control is only supported by MoveEnv. "
-                    "Set KEYBOARD_CONTROL=False when playing BalanceEnv."
-                )
             keyboard_controller = KeyboardCommandController(
-                initial_command=FIXED_COMMAND,
+                initial_command=INITIAL_COMMAND,
                 leg_length_range=base_env.cfg.command_leg_length_range,
             )
 
-        active_command = FIXED_COMMAND
+        active_command = INITIAL_COMMAND
         apply_command(base_env, active_command)
 
         # reset()返回的观测可能仍包含随机指令；覆盖指令后重新生成观测。
@@ -337,7 +318,7 @@ def main():
         print(f"[INFO] Device: {base_env.device}")
         print(f"[INFO] Observation shape: {tuple(policy_observations.shape)}")
         print(f"[INFO] Policy frequency: {1.0 / base_env.step_dt:.1f} Hz")
-        print(f"[INFO] Initial command: {FIXED_COMMAND}")
+        print(f"[INFO] Initial command: {INITIAL_COMMAND}")
         if keyboard_controller is not None:
             print("[CONTROL] W/S: +0.8/-0.8 m/s")
             print("[CONTROL] Ctrl+W/S: +1.5/-1.5 m/s")

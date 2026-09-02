@@ -19,9 +19,11 @@ from double_pendulum_rl.utils import MoveEnvLogger, SustainedThresholdPenalty
 class MoveEnvCfg(DirectRLEnvCfg):
     """移动、转向、腿长指令跟踪环境配置。"""
 
-    # 时间参数
+    # =========================================================
+    # Fixed interface configuration
+    # =========================================================
+
     decimation = 2  # 策略频率 120 / 2 = 60Hz
-    episode_length_s = 20.0  # episode最长时间20s
 
     # 6维策略输出：
     # [左髋, 右髋, 左膝, 右膝, 左轮, 右轮]
@@ -84,43 +86,45 @@ class MoveEnvCfg(DirectRLEnvCfg):
     leg_velocity_obs_scale = 0.1
     wheel_velocity_obs_scale = 0.05
 
-    # 重置随机化参数
-    initial_pitch_range = math.radians(2.0)
-    initial_leg_position_noise = 0.02
-    initial_joint_velocity_noise = 0.05
-
-    # 指令采样参数：
-    # [机体坐标系X方向速度, 绕机体Z轴角速度, 髋到轮轴的腿长]
-    command_forward_velocity_range = (-1.5, 1.5)
-    command_yaw_velocity_range = (-0.8, 0.8)
-    # 第一阶段先使用较窄范围，避免策略通过长期蹲到最低来换取稳定。
-    # 学会可靠跟踪后再逐步扩大到最终训练范围。
-    command_leg_length_range = (0.30, 0.40)
-    command_resampling_time_s = 3.0
-    standing_command_probability = 0.15
-
     # 指令进入策略观测前的缩放参数
     # 按当前采样范围缩放后，三维指令都大致位于[-1, 1]。
-    command_forward_obs_scale = 1.0 / 1.5
-    command_yaw_obs_scale = 1.0 / 0.8
+    command_forward_obs_scale = 1.0 / 2.5
+    command_yaw_obs_scale = 1.0 / 1.8
     command_leg_length_obs_scale = 10.0
+    command_leg_length_center = 0.35
 
     # URDF中上下腿连杆长度，用于根据膝角计算髋到轮轴的实际距离。
     upper_leg_length = 0.30
     lower_leg_length = 0.30
+
+    # =========================================================
+    # Task configuration
+    # =========================================================
+
+    episode_length_s = 20.0  # episode最长时间20s
+
+    # 指令采样参数：
+    # [机体坐标系X方向速度, 绕机体Z轴角速度, 髋到轮轴的腿长]
+    command_forward_velocity_range = (-2.5, 2.5)
+    command_yaw_velocity_range = (-1.8, 1.8)
+    command_leg_length_range = (0.25, 0.45)
+    command_resampling_time_s = 8.0
+    standing_command_probability = 0.15
+
+    # 重置随机化参数
+    initial_pitch_range = math.radians(2.0)
+    initial_leg_position_noise = 0.02
+    initial_joint_velocity_noise = 0.05
 
     # 终止参数。这里的高度只用于判断倒地或异常腾空，和腿长指令分开。
     minimum_base_height = 0.25
     maximum_base_height = 0.78
     termination_gravity_z = -0.5
 
-    # 腿长指令中心值，用于让第三维指令观测以零附近为中心。
-    target_leg_length = 0.35
-
     # 指令跟踪奖励权重和误差敏感度
-    reward_forward_tracking = 2.0
-    reward_yaw_tracking = 1.0
-    reward_leg_length_tracking = 3.0
+    reward_forward_tracking = 3.0
+    reward_yaw_tracking = 2.0
+    reward_leg_length_tracking = 4.0
     forward_tracking_error_scale = 4.0
     yaw_tracking_error_scale = 2.0
     # 指数奖励负责目标附近的精细跟踪；适当减小尺度，避免远离目标时
@@ -421,7 +425,7 @@ class MoveEnv(DirectRLEnv):
             (
                 self.commands[:, 0] * self.cfg.command_forward_obs_scale,
                 self.commands[:, 1] * self.cfg.command_yaw_obs_scale,
-                (self.commands[:, 2] - self.cfg.target_leg_length)
+                (self.commands[:, 2] - self.cfg.command_leg_length_center)
                 * self.cfg.command_leg_length_obs_scale,
             ),
             dim=-1,

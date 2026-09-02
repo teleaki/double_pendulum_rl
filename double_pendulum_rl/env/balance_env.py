@@ -3,7 +3,7 @@ import torch
 
 import isaaclab.sim as sim_utils
 
-from isaaclab.assets import Articulation, ArticulationCfg
+from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
@@ -19,19 +19,21 @@ from double_pendulum_rl.robot import ROBOT_CFG
 
 @configclass
 class BalanceEnvCfg(DirectRLEnvCfg):
-    # 时间参数
+    # =========================================================
+    # Fixed interface configuration
+    # =========================================================
+
     decimation = 2  # 策略频率 120 / 2 = 60Hz
-    episode_length_s = 10.0  # episode最长时间10s
 
     # 6维策略输出：
     # [左髋, 右髋, 左膝, 右膝, 左轮, 右轮]
     action_space = 6
 
-    # 25维观测空间：
+    # 28维观测空间：
     # 重力投影 3, 车身角速度 3, 车身线速度 3,
     # 腿关节位置 4, 腿关节速度 4, 轮子速度 2,
-    # 上一次输出 6
-    observation_space = 25
+    # 运动指令 3, 上一次输出 6
+    observation_space = 28
 
     # 物理仿真
     sim = SimulationCfg(
@@ -83,6 +85,23 @@ class BalanceEnvCfg(DirectRLEnvCfg):
     leg_position_obs_scale = 1.0
     leg_velocity_obs_scale = 0.1
     wheel_velocity_obs_scale = 0.05
+
+    command_forward_obs_scale = 1.0
+    command_yaw_obs_scale = 1.0
+    command_leg_length_obs_scale = 10.0
+    command_leg_length_center = 0.35
+
+    # =========================================================
+    # Task configuration
+    # =========================================================
+
+    episode_length_s = 10.0  # episode最长时间10s
+
+    # Balance任务不变化指令，但保留项目统一的三维指令接口。
+    command_forward_velocity_range = (0.0, 0.0)
+    command_yaw_velocity_range = (0.0, 0.0)
+    command_leg_length_range = (0.35, 0.35)
+    command_resampling_time_s = 3.0
 
     # 重置随机化
     initial_pitch_range = math.radians(2.0)
@@ -178,6 +197,16 @@ class BalanceEnv(DirectRLEnv):
             device=self.device,
         )
 
+        self.commands = torch.zeros(
+            (self.num_envs, 3), dtype=torch.float32, device=self.device
+        )
+        self.command_time_left = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.command_resample_pending = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+
     def _setup_scene(self):
         # 创建机器人
         self.robot = Articulation(self.cfg.robot_cfg)
@@ -205,6 +234,25 @@ class BalanceEnv(DirectRLEnv):
         )
         light_cfg.func("/World/Light", light_cfg)
 
+    def _sample_commands(self, env_ids):
+        if env_ids.numel() == 0:
+            return
+
+        sampled_commands = torch.empty(
+            (env_ids.numel(), 3), dtype=torch.float32, device=self.device
+        )
+        sampled_commands[:, 0].uniform_(
+            *self.cfg.command_forward_velocity_range
+        )
+        sampled_commands[:, 1].uniform_(
+            *self.cfg.command_yaw_velocity_range
+        )
+        sampled_commands[:, 2].uniform_(
+            *self.cfg.command_leg_length_range
+        )
+        self.commands[env_ids] = sampled_commands
+        self.command_time_left[env_ids] = self.cfg.command_resampling_time_s
+
     def _pre_physics_step(self, actions):
         # 更新上帧输出
         self.previous_actions.copy_(self.actions)
@@ -225,6 +273,9 @@ class BalanceEnv(DirectRLEnv):
                 max=self.cfg.action_clip,
             )
         )
+
+        self.command_time_left -= self.step_dt
+        self.command_resample_pending |= self.command_time_left <= 0.0
 
     def _apply_action(self):
         # 清空旧力矩
@@ -249,7 +300,7 @@ class BalanceEnv(DirectRLEnv):
 
         leg_pos_error = joint_pos[:, self.leg_joint_ids] - self.default_leg_pos
 
-        observations = torch.cat(
+        state_obs = torch.cat(
             (
                 # 3维：重力在车身坐标系中的投影。
                 self.robot.data.projected_gravity_b * self.cfg.gravity_obs_scale,
@@ -263,9 +314,25 @@ class BalanceEnv(DirectRLEnv):
                 joint_vel[:, self.leg_joint_ids] * self.cfg.leg_velocity_obs_scale,
                 # 2维：轮子速度。
                 joint_vel[:, self.wheel_joint_ids] * self.cfg.wheel_velocity_obs_scale,
-                # 6维：刚刚执行的动作。
-                self.actions,
             ),
+            dim=-1,
+        )
+
+        command_obs = torch.stack(
+            (
+                self.commands[:, 0] * self.cfg.command_forward_obs_scale,
+                self.commands[:, 1] * self.cfg.command_yaw_obs_scale,
+                (
+                    self.commands[:, 2]
+                    - self.cfg.command_leg_length_center
+                )
+                * self.cfg.command_leg_length_obs_scale,
+            ),
+            dim=-1,
+        )
+
+        observations = torch.cat(
+            (state_obs, command_obs, self.actions),
             dim=-1,
         )
 
@@ -431,6 +498,12 @@ class BalanceEnv(DirectRLEnv):
             dim=0,
         )
 
+        # 本步奖励已使用旧指令结算，再为下一步切换指令。
+        resample_mask = self.command_resample_pending & ~self.reset_terminated
+        resample_ids = torch.nonzero(resample_mask, as_tuple=False).squeeze(-1)
+        self.command_resample_pending.zero_()
+        self._sample_commands(resample_ids)
+
         # 防止异常仿真状态把 NaN 传入训练器。
         return torch.nan_to_num(
             total_reward,
@@ -454,6 +527,7 @@ class BalanceEnv(DirectRLEnv):
         self.actions[env_ids] = 0.0
         self.previous_actions[env_ids] = 0.0
         self.joint_efforts[env_ids] = 0.0
+        self.command_resample_pending[env_ids] = False
 
         # 清空关节力矩目标，避免重置前的力矩残留。
         self.robot.set_joint_effort_target(
@@ -550,3 +624,5 @@ class BalanceEnv(DirectRLEnv):
             joint_vel,
             env_ids=env_ids,
         )
+
+        self._sample_commands(env_ids)

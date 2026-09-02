@@ -1,44 +1,37 @@
-from isaaclab.app import AppLauncher
 from pathlib import Path
 
+from isaaclab.app import AppLauncher
 
-# 训练参数
+
+# ------------------------------------------------------------
+# 训练配置
+# ------------------------------------------------------------
+
 TASK_NAME = "WheelLeg-Move-Direct-v0"
-MODEL_NAME = "wheel_leg_move.onnx"
+MODEL_BASENAME = "wheel_leg_move_v2"
 NUM_ENVS = 256
-
+NUM_TRAINING_ITERATIONS = None
+RESUME_TRAINING = True
+RESUME_CHECKPOINT_PATH = (
+    Path(__file__).resolve().parents[1] / "assets" / "pre_models" / "model_2999.pt"
+)
 HEADLESS = False
 
-# None表示使用MovePPORunnerCfg.max_iterations；填写整数可临时覆盖。
-NUM_TRAINING_ITERATIONS = None
-RESUME_TRAINING = False
-RESUME_CHECKPOINT_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "logs"
-    / "rsl_rl"
-    / "wheel_leg_balance_direct"
-    / "2026-08-26_21-17-09"
-    / "model_700.pt"
-)
 
+def get_available_model_paths(output_dir: Path, model_basename: str):
+    """返回同一版本且不会覆盖已有文件的PT/ONNX路径。
 
-def get_available_model_path(model_path: Path) -> Path:
-    """返回不会覆盖已有文件的模型路径。
-
-    原路径不存在时直接使用；存在时依次尝试 ``name (1).onnx``、
-    ``name (2).onnx``，直到找到尚未使用的文件名。
+    只要同版本的PT或ONNX任意一个已存在，就为两者一起使用
+    下一个序号，避免训练检查点和推理模型版本错位。
     """
 
-    if not model_path.exists():
-        return model_path
-
-    index = 1
+    index = 0
     while True:
-        candidate = model_path.with_name(
-            f"{model_path.stem} ({index}){model_path.suffix}"
-        )
-        if not candidate.exists():
-            return candidate
+        suffix = "" if index == 0 else f" ({index})"
+        pt_path = output_dir / f"{model_basename}{suffix}.pt"
+        onnx_path = output_dir / f"{model_basename}{suffix}.onnx"
+        if not pt_path.exists() and not onnx_path.exists():
+            return pt_path, onnx_path
         index += 1
 
 
@@ -147,6 +140,10 @@ def main():
 
         # 根据训练参数决定是否从已有的PT检查点继续训练。
         if RESUME_TRAINING:
+            if RESUME_CHECKPOINT_PATH is None:
+                raise ValueError(
+                    "Set RESUME_CHECKPOINT_PATH when RESUME_TRAINING=True."
+                )
             if not RESUME_CHECKPOINT_PATH.is_file():
                 raise FileNotFoundError(
                     f"Resume checkpoint not found: {RESUME_CHECKPOINT_PATH}"
@@ -165,29 +162,30 @@ def main():
             init_at_random_ep_len=True,
         )
 
-        # runner.learn()结束时会自动保存最终的PT检查点。
-        final_checkpoint_path = (
-            log_dir / f"model_{runner.current_learning_iteration}.pt"
-        )
-
-        # 将最终策略切换到推理模式并导出为ONNX。
-        runner.eval_mode()
-
         output_dir = project_root / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 保留已经导出的同名模型，自动为新模型添加递增序号。
-        output_model_path = get_available_model_path(output_dir / MODEL_NAME)
+        # PT和ONNX使用相同版本名，且不覆盖已有输出。
+        output_pt_path, output_onnx_path = get_available_model_paths(
+            output_dir,
+            MODEL_BASENAME,
+        )
+
+        # PT保留Actor、Critic、优化器和训练状态，可用于继续训练。
+        runner.save(str(output_pt_path))
+
+        # ONNX只用于策略推理和部署。
+        runner.eval_mode()
 
         export_policy_as_onnx(
             policy=runner.alg.policy,
             normalizer=runner.alg.policy.actor_obs_normalizer,
             path=str(output_dir),
-            filename=output_model_path.name,
+            filename=output_onnx_path.name,
         )
 
-        print(f"[PASS] Final PT model saved to: {final_checkpoint_path}")
-        print(f"[PASS] ONNX policy exported to: {output_model_path}")
+        print(f"[PASS] Trainable PT checkpoint saved to: {output_pt_path}")
+        print(f"[PASS] ONNX policy exported to: {output_onnx_path}")
 
     finally:
         if env is not None:

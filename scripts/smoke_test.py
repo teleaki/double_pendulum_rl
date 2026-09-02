@@ -5,19 +5,12 @@ from isaaclab.app import AppLauncher
 # 测试配置
 # ------------------------------------------------------------
 
-# 通过Gym任务名选择需要测试的环境：
-# "WheelLeg-Balance-Direct-v0"：原地平衡环境
-# "WheelLeg-Move-Direct-v0"：移动、旋转和腿高指令环境
 TASK_NAME = "WheelLeg-Move-Direct-v0"
-
 NUM_ENVS = 16
 NUM_TEST_STEPS = 1200
 SEED = 42
-
-# "random"使用小幅随机动作；"zero"对全部关节施加零力矩。
 ACTION_MODE = "random"
 ACTION_NOISE_SCALE = 0.05
-
 PRINT_INTERVAL = 60
 HEADLESS = False
 RENDER_MODE = None if HEADLESS else "human"
@@ -41,15 +34,15 @@ from isaaclab_tasks.utils import load_cfg_from_registry
 def main():
     """按照顶部测试配置创建并检查指定的强化学习环境。"""
 
+    # 固定随机种子，方便比较多次测试结果。
     if ACTION_MODE not in {"random", "zero"}:
         raise ValueError(
             f"Unsupported ACTION_MODE={ACTION_MODE!r}; expected 'random' or 'zero'."
         )
 
-    # 固定随机种子，方便比较多次测试结果。
     torch.manual_seed(SEED)
 
-    # 根据TASK_NAME从Gym注册信息中加载对应的环境配置类。
+    # 从Gym注册信息中加载对应的环境配置类。
     env_cfg = load_cfg_from_registry(
         TASK_NAME,
         "env_cfg_entry_point",
@@ -182,13 +175,11 @@ def main():
                     f"time_outs={time_out_count}"
                 )
 
-                # MoveEnv提供commands；BalanceEnv没有该字段。
-                if hasattr(base_env, "commands"):
-                    command_mean = base_env.commands.mean(dim=0).tolist()
-                    print(
-                        "[COMMAND] mean="
-                        f"{[round(value, 3) for value in command_mean]}"
-                    )
+                command_mean = base_env.commands.mean(dim=0).tolist()
+                print(
+                    "[COMMAND] mean="
+                    f"{[round(value, 3) for value in command_mean]}"
+                )
 
         print("[PASS] Environment smoke test finished without NaN or Inf.")
         print(f"[INFO] Total terminated resets: {total_terminated}")
