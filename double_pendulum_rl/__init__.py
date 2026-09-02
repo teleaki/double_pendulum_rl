@@ -6,11 +6,9 @@ gym.register(
     entry_point="double_pendulum_rl.env.balance_env:BalanceEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": (
-            "double_pendulum_rl.env.balance_env:BalanceEnvCfg"
-        ),
+        "env_cfg_entry_point": ("double_pendulum_rl.env.balance_env:BalanceEnvCfg"),
         "rsl_rl_cfg_entry_point": (
-            "double_pendulum_rl.agents.ppo_cfg:BalancePPORunnerCfg"
+            "double_pendulum_rl.agents.balance_ppo_cfg:BalancePPORunnerCfg"
         ),
     },
 )
@@ -23,7 +21,7 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": "double_pendulum_rl.env.move_env:MoveEnvCfg",
         "rsl_rl_cfg_entry_point": (
-            "double_pendulum_rl.agents.ppo_cfg:MovePPORunnerCfg"
+            "double_pendulum_rl.agents.move_ppo_cfg:MovePPORunnerCfg"
         ),
     },
 )
